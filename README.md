@@ -1,1 +1,614 @@
-# terratest
+# SIMPHERA Reference Architecture for AWS
+
+This repository contains the reference architecture of the infrastructure needed to deploy dSPACE SIMPHERA to AWS. It does not contain the helm chart needed to deploy SIMPHERA itself, but only the base infrastructure such as Kubernetes, PostgreSQL, S3 buckets, etc.
+
+You can use the reference architecture as a starting point for your SIMPHERA installation if you plan to deploy SIMPHERA to AWS. You can use the reference architecture as it is and only have to configure few individual values. If you have special requirements feel free to adapt the architecture to your needs. For example, the reference architecture does not contain any kind of VPN connection to a private, on-premise network because this is highly user specific. But the reference architecture is configured in such a way that the ingress points are available in the public internet.
+
+Using the reference architecture you can deploy a single or even multiple instances of SIMPHERA, e.g. one for _production_ and one for _testing_.
+
+## Architecture
+
+The following figure shows the main resources of the architecture:
+![SIMPHERA Reference Architecture for AWS](AWSReferenceArchitecture.png)
+The main building brick of the SIMPHERA reference architecture for AWS is the Amazon EKS cluster.
+The cluster contains two auto scaling groups:
+The first group is reserved for SIMPHERA services and other auxiliary third-party services like Keycloak, nginx, etc.
+The second group is for the executors that perform the testing of the system under test.
+The data for SIMPHERA projects is stored in a Amazon RDS PostgreSQL instance.
+Keycloak stores SIMPHERA users in a separate Amazon RDS PostgreSQL instance.
+Executors need licenses to execute tests and simulations.
+They obtain the licenses from a license server.
+The license server is deployed on an EC2 instance.
+Project files and test results are stored in an non-public Amazon S3 bucket.
+For the initial setup of the license server, several files need to be exchanged between an administration PC and the license server.
+These files are exchanged via an non-public S3 bucket that can be read and written from the administration PC and the license server.
+A detailed list of the AWS resources that are mandatory/optional for the operation of SIMPHERA can be found in the [AWSCloudSpec](./AWSCloudSpec.md).
+
+## Billable Resources and Services
+
+Charges may apply for the following AWS resources and services:
+
+| Service | Description | Mandatory? |
+| ------- | ----------- | ---------- |
+| Amazon Elastic Kubernetes Service | A Kubernetes cluster is required to run SIMPHERA. | Yes |
+| Amazon Virtual Private Cloud | Virtual network for SIMPHERA. | Yes |
+| Elastic Load Balancing | SIMPHERA uses a network load balancer. | Yes |
+| Amazon EC2 Auto Scaling | SIMPHERA automatically scales compute nodes if the capacity is exhausted. | Yes |
+| Amazon Relational Database | Project and authorization data is stored in Amazon RDS for PostgreSQL instances. | Yes |
+| Amazon Simple Storage Service | Binary artifacts are stored in an S3 bucket. | Yes |
+| Amazon Elastic File System | Binary artifacts are stored temporarily in EFS. | Yes |
+| AWS Key Management Service (AWS KMS) | Encryption for Kubernetes secrets is enabled by default. | |
+| Amazon Elastic Compute Cloud | Optionally, you can deploy a dSPACE license server on an EC2 instance. Alternatively, you can deploy the server on external infrastructure. For additional information, please contact our support team. ||
+| Amazon CloudWatch | Metrics and container logs to CloudWatch. It is recommended to deploy the dSPACE monitoring stack in Kubernetes.||
+
+## Usage Instructions
+
+To create the AWS resources that are required for operating SIMPHERA, you need to accomplish the following tasks:
+
+1. install Terraform on your local administration PC
+1. register an AWS account where the resources needed for SIMPHERA are created
+1. create an IAM user with least privileges required to create the resources for SIMPHERA
+1. create security credentials for that IAM user
+1. request service quota increase for gpu instances if needed
+1. create non-public S3 bucket for Terraform state
+1. create IAM policy that gives the IAM user access to the S3 bucket
+1. clone this repository onto your local administration PC
+1. create Secrets manager secrets
+1. adjust Terraform variables
+1. apply Terraform configuration
+1. connect to the Kubernetes cluster
+
+### Install Terraform
+
+This reference architecture is provided as a [Terraform](https://terraform.io/) configuration. Terraform is an open-source command line tool to automatically create and manage cloud resources. A Terraform configuration consists of various `.tf` text files. These files contain the specifications of the resources to be created in the cloud infrastructure. That is the reason why this approach is called _infrastructure-as-code_. The main advantage of this approach is _reproducibility_ because the configuration can be mainted in a source control system such as Git.
+
+Terraform uses _variables_ to make the specification configurable. The concrete values for these variables are specified in `.tfvars` files. So it is the task of the administrator to fill the `.tfvars` files with the correct values. This is explained in more detail in a later chapter.
+
+Terraform has the concept of a _state_. On the one hand side there are the resource specifications in the `.tf` files. On the other hand there are the resources in the cloud infrastructure that are created based on these files. Terraform needs to store _mapping information_ which element of the specification belongs to which resource in the cloud infrastructure. This mapping is called the _state_. In general you could store the state on your local hard drive. But that is not a good idea because in that case nobody else could change some settings and apply these changes. Therefore the state itself should be stored in the cloud.
+
+### Request service quota for gpu computing instances
+
+If you want to run [AURELION](https://www.dspace.com/en/pub/home/products/sw/experimentandvisualization/aurelion_sensor-realistic_sim.cfm) with your SIMPHERA solution, you need to add gpu instances to your cluster.
+
+In case you want to add a gpu node pool to your AWS infrastructure, you might have to increase the [quota](https://docs.aws.amazon.com/servicequotas/latest/userguide/intro.html) for the gpu instance type you have selected. Per default, the SIMPHERA Reference Architecture for AWS uses g5.2xlarge instances. The quota [_Running On-Demand P instances_](https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-417A185B) sets the maximum number of vCPUs assigned to the Running On-Demand P instances for a specific AWS region. Every g5.2xlarge instance has 8 vCPUs, which is why the quota has to be at least 8 for the AWS region where you want to deploy the instances.
+
+### Create Security Credentials <a name="awsprofile"></a>
+
+You can create [security credentials](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html#Using_CreateAccessKey) for that IAM user with the AWS console.
+Terraform uses these security credentials to create AWS resources on your behalf.
+
+On your administration PC you need to install the [Terraform](https://terraform.io/) command and the [AWS CLI](https://aws.amazon.com/cli/).
+To [configure your aws account](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-quickstart.html) run the following command:
+
+```bash
+aws configure --profile <profile-name>
+
+AWS Access Key ID [None]: *********
+AWS Secret Access Key [None]: *******
+Default region name [None]: eu-central-1
+Default output format [None]: json
+```
+
+If you have been provided with session token, you can add it via following command:
+
+```bash
+aws configure set aws_session_token "<your_session_token>" --profile <profile-name>
+```
+
+Access credentials are typically stored in `~/.aws/credentials` and configurations in `~/.aws/config`.
+There are [various ways](https://registry.terraform.io/providers/hashicorp/aws/latest/docs#authentication-and-configuration) on how to authenticate, to run Terraform.
+This depends on your specific setup.
+
+Verify connectivity and your access credentials by executing following command:
+
+```bash
+aws sts get-caller-identity
+
+{
+    "UserId": "REWAYDCFMNYCPKCWRZEHT:JohnDoe@dspace.com",
+    "Account": "592245445799",
+    "Arn": "arn:aws:sts::592245445799:assumed-role/AWSReservedSSO_AdministratorAccess_vmcbaym7ueknr9on/JohnDoe@dspace.com"
+}
+```
+
+### Create State Bucket
+
+As mentioned before, Terraform stores the state of the resources it creates within an S3 bucket.
+The bucket name needs to be globally unique.
+
+After you have created the bucket, you need to link it with Terraform:
+To do so, please make a copy of the file `state-backend-template`, name it `state-backend.tf` and open the file in a text editor. With this backend configuration, Terraform stores the state as a given `key` in the given S3 `bucket` you have created before.
+
+
+```hcl
+terraform {
+  backend "s3" {
+    #The name of the bucket to be used to store the terraform state. You need to create this container manually.
+    bucket = "terraform-state"
+    #The name of the file to be used inside the container to be used for this terraform state.
+    key    = "simphera.tfstate"
+    #The region of the bucket.
+    region = "eu-central-1"
+  }
+}
+```
+
+Important: It is highly recommended to [enable server-side encryption of the state file](https://www.terraform.io/language/settings/backends/s3). Encryption is not enabled per default.
+
+### Create IAM Policy for State Bucket
+
+Create the following [IAM policy for accessing the Terraform state bucket](https://www.terraform.io/language/settings/backends/s3#s3-bucket-permissions) and assign it to the IAM user:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "<your_account_arn>"
+            },
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::terraform-state"
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "<your_account_arn>"
+            },
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+            ],
+            "Resource": "arn:aws:s3:::terraform-state/<storage_key_state_backend>"
+        }
+    ]
+}
+```
+
+Your account ARN (Amazon Resource Number) is in the output of `aws sts get-caller-identity` command.
+
+### Create Secrets Manager Secrets
+
+Username and password for the PostgreSQL databases are stored in AWS Secrets Manager.
+Before you let Terraform create AWS resources, you need to manually create a Secrets Manager secret that stores the username and password.
+It is recommended to create individual secrets per SIMPHERA instance (e.g. production and staging instance).
+To create the secret, open the Secrets Manager console and click the button `Store a new secret`.
+As secret type choose `Other type of secret`.
+The password must contain from 8 to 128 characters and must not contain any of the following: / (slash), '(single quote), "(double quote) and @ (at sign).
+Open the Plaintext tab and paste the following JSON object and enter your usernames and passwords:
+
+```json
+{
+  "postgresql_password": "<your password>"
+}
+```
+
+Alternatively, you can create the secret with the following Powershell script:
+
+```powershell
+$region = "<your region>"
+$postgresqlCredentials = @"
+{
+    "postgresql_password" : "<your password>"
+}
+"@ | ConvertFrom-Json | ConvertTo-Json -Compress
+$postgresqlCredentials = $postgresqlCredentials -replace '([\\]*)"', '$1$1\"'
+aws secretsmanager create-secret --name <secret name> --secret-string $postgresqlCredentials --region $region
+```
+
+On the next page you can define a name for the secret.
+Automatic credentials rotation is currently not supported by SIMPHERA, but you can <a href="#rotating-credentials">rotate secrets manually</a>.
+You have to provide the name of the secret in your Terraform variables.
+The next section describes how you need to adjust your Terraform variables.
+
+### Adjust Terraform Variables
+
+For your configuration, please rename the template file `terraform.tfvars.example` to `terraform.tfvars` and open it in a text editor.
+This file contains all variables that are configurable including documentation of the variables. Please adapt the values before you deploy the resources.
+
+```diff
+simpheraInstances = {
+  "production" = {
++    secretname = "<secret name>"
+    }
+}
+```
+
+Also rename the file `providers.tf.example` to `main.tf` and fill in the name of the [AWS profile you have created before](#awsprofile).
+
+```diff
+provider "aws" {
++  profile = "<profile-name>"
+}
+```
+
+### Apply Terraform Configuration
+
+Before you can deploy the resources to AWS you have to initialize Terraform:
+
+```sh
+terraform init
+```
+
+Afterwards you can deploy the resources:
+
+```sh
+terraform apply
+```
+
+Terraform automatically loads the variables from your `terraform.tfvars` variable definition file.
+Installation times may very, but it is expected to take up to 30 min to complete the deployment.
+Note that `eks-addons` module dependency on managed node group(s) is commented out in `k8s.tf` file. This might increase
+deployment time, as various addons might be provisioned before any actual K8s worker node starts, to complete addon deployment.
+Default timeout for node/addon deployment is 20 minutes, so please be patient.  If this behaviour creates problems, you can
+always uncomment line `depends_on = [module.eks.managed_node_groups]`.
+It is recommended to use AWS `admin` account, or ask your AWS administrator to assign necessary IAM roles and permissions to your user.
+
+### Destroy Infrastructure
+
+Resources that contain data, i.e. the databases, S3 storage, and the recovery points in the backup vault are protected against unintentional deletion.
+:warning: **If you continue with the procedure described in this section, your data will be irretrievably deleted.**
+
+Before the backup vault can be deleted, all the continuous recovery points for S3 storage and the databases need to be deleted, for example by using the following Powershell snippet:
+
+```powershell
+$vaults = terraform output backup_vaults | ConvertFrom-Json
+$profile = "<profile_name>"
+foreach ($vault in $vaults){
+  Write-Host "Deleting $vault"
+  $recoverypoints = aws backup list-recovery-points-by-backup-vault --profile $profile --backup-vault-name $vault | ConvertFrom-Json
+  foreach ($rp in $recoverypoints.RecoveryPoints){
+    aws backup delete-recovery-point --profile $profile --backup-vault-name $vault --recovery-point-arn $rp.RecoveryPointArn
+  }
+  foreach ($rp in $recoverypoints.RecoveryPoints){
+    Do
+    {
+      Start-Sleep -Seconds 10
+      aws backup describe-recovery-point --profile $profile --backup-vault-name $vault --recovery-point-arn $rp.RecoveryPointArn | ConvertFrom-Json
+    } while( $LASTEXITCODE -eq 0)
+  }
+  aws backup delete-backup-vault --profile $profile --backup-vault-name $vault
+}
+```
+
+Before the databases can be deleted, you need to remove their delete protection:
+
+```powershell
+$databases = terraform output database_identifiers | ConvertFrom-Json
+foreach ($db in $databases){
+  Write-Host "Deleting database $db"
+  aws rds modify-db-instance --profile $profile --db-instance-identifier $db --no-deletion-protection
+  aws rds delete-db-instance --profile $profile --db-instance-identifier $db --skip-final-snapshot
+}
+```
+
+To delete the S3 buckets that contains both versioned and non-versioned objects, the buckets must first be emptied. The following PowerShell script can be used to erase all objects within the buckets and then delete the buckets.
+
+```powershell
+$aws_profile = "<profile_name>"
+$buckets = terraform output s3_buckets | ConvertFrom-Json
+foreach ($bucket in $buckets) {
+    Write-Output "Deleting bucket: $bucket" 
+    $deleteObjDict = @{}
+    $deleteObj = New-Object System.Collections.ArrayList
+    aws s3api list-object-versions --bucket $bucket --profile $aws_profile --query '[Versions[*].{ Key:Key , VersionId:VersionId} , DeleteMarkers[*].{ Key:Key , VersionId:VersionId}]' --output json `
+    | ConvertFrom-Json | ForEach-Object { $_ } | ForEach-Object { $deleteObj.add($_) } | Out-Null
+    $n = [math]::Ceiling($deleteObj.Count / 100)
+    for ($i = 0; $i -lt $n; $i++) {
+        $deleteObjDict["Objects"] = $deleteObj[(0 + $i * 100)..(100 * ($i + 1))]
+        $deleteObjDict["Objects"] = $deleteObjDict["Objects"] | Where-Object { $_ -ne $null }
+        $deleteStuff = $deleteObjDict | ConvertTo-Json
+        aws s3api delete-objects --bucket $bucket --profile $aws_profile --delete $deleteStuff | Out-Null
+    }
+    aws s3 rb s3://$bucket --force --profile $aws_profile
+    Write-Output "$bucket bucket deleted"
+}
+```
+
+The remaining infrastructure resources can be deleted via Terraform.
+Due to a bug, Terraform is not able to properly [plan the removal of resources in the right order](https://github.com/aws-ia/terraform-aws-eks-blueprints/issues/353) which leads to a deadlock.
+To workaround the bug, you need to need to remove the `eks-addons` module at first:
+
+```sh
+terraform destroy -target="module.eks-addons"
+```
+
+:warning: **It is important that you have completed the preceding steps. Otherwise, the following command will not finish completly, leaving you in a deadlock state.**
+
+To delete the remaining resources, run the following command:
+
+```sh
+terraform destroy
+```
+
+### Connect to Kubernetes Cluster
+
+This deployment contains a managed Kubernetes cluster (EKS).
+In order to use command line tools such as `kubectl` or `helm` you need a _kubeconfig_ configuration file.
+You can update your _kubeconfig_ using the [aws cli update-kubeconfig command](https://awscli.amazonaws.com/v2/documentation/api/latest/reference/eks/update-kubeconfig.html):
+
+```bash
+aws eks --region <region> update-kubeconfig --name <cluster_name> --kubeconfig <filename>
+```
+
+## Backup and Restore
+
+SIMPHERA stores data in the PostgreSQL database and in S3 buckets (MinIO) that needs to be backed up.
+AWS supports continuous backups for Amazon RDS for PostgreSQL and S3 that allows point-in-time recovery.
+[Point-in-time recovery](https://docs.aws.amazon.com/aws-backup/latest/devguide/point-in-time-recovery.html) lets you restore your data to any point in time within a defined retention period.
+
+This Terraform module creates an AWS backup plan that makes continuous backups of the PostgreSQL database and S3 buckets.
+The backups are stored in an AWS backup vault per SIMPHERA instance.
+An IAM role is also automatically created that has proper permissions to create backups.
+To enable backups for your SIMPHERA instance, make sure you have the flag `enable_backup_service` et in your `.tfvars` file:
+
+```hcl
+simpheraInstances = {
+  "production" = {
+        enable_backup_service    = true
+    }
+}
+```
+
+### Amazon RDS for PostgreSQL
+
+Create an target RDS instance (backup server) that is a copy of a source RDS instance (production server) of a specific point-in-time.
+The command [`restore-db-instance-to-point-in-time`](https://awscli.amazonaws.com/v2/documentation/api/latest/reference/rds/restore-db-instance-to-point-in-time.html) creates the target database.
+Most of the configuration settings are copied from the source database.
+To be able to connect to the target instance the easiest way is to explicitly set the same security group and subnet group as used for the source instance.
+
+Restoring an RDS instance can be done via Powershell as described in the remainder:
+
+```bash
+aws rds restore-db-instance-to-point-in-time --source-db-instance-identifier simphera-reference-production-simphera --target-db-instance simphera-reference-production-simphera-backup --vpc-security-group-ids sg-0b954a0e25cd11b6d --db-subnet-group-name simphera-reference-vpc --restore-time 2022-06-16T23:45:00.000Z --tags Key=timestamp,Value=2022-06-16T23:45:00.000Z
+```
+
+Execute the following command to create the pgdump pod using the standard postgres image and open a bash:
+
+```bash
+kubectl run pgdump -ti -n simphera --image postgres --kubeconfig .\kube.config -- bash
+```
+
+In the pod's Bash, use the pg_dump and pg_restore commands to stream the data from the backup server to the production server:
+
+```bash
+pg_dump -h simphera-reference-production-simphera-backup.cexy8brfkmxk.eu-central-1.rds.amazonaws.com -p 5432 -U dbuser -Fc simpherareferenceproductionsimphera | pg_restore --clean --if-exists -h simphera-reference-production-simphera.cexy8brfkmxk.eu-central-1.rds.amazonaws.com -p 5432 -U dbuser -d simpherareferenceproductionsimphera
+```
+
+Alternatively, you can [restore the RDS instance via the AWS console](https://docs.aws.amazon.com/aws-backup/latest/devguide/restoring-rds.html).
+
+### S3
+
+This Terraform creates an S3 bucket for project data and results and enables versioning of the S3 bucket which is a requirement for point-in-time recovery.
+
+To restore the S3 buckets to an older version you need to create an IAM role that has proper permissions:
+
+```powershell
+$rolename = "restore-role"
+$trustrelation = @"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": ["sts:AssumeRole"],
+      "Effect": "allow",
+      "Principal": {
+        "Service": ["backup.amazonaws.com"]
+      }
+    }
+  ]
+}
+"@
+echo $trustrelation > trust.json
+aws iam create-role --role-name $rolename --assume-role-policy-document file://trust.json --description "Role to restore"
+aws iam attach-role-policy --role-name $rolename --policy-arn="arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore"
+aws iam attach-role-policy --role-name $rolename --policy-arn="arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores"
+$rolearn=aws iam get-role --role-name $rolename --query 'Role.Arn'
+```
+
+Restoring an S3 bucket can be done via Powershell as described in the remainder:
+You can restore the S3 data in-place, into another existing bucket, or into a new bucket.
+
+```powershell
+$uuid = New-Guid
+$metadata = @"
+{
+  "DestinationBucketName": "man-validation-platform-int-results",
+  "NewBucket": "true",
+  "RestoreTime": "2022-06-20T23:45:00.000Z",
+  "Encrypted": "false",
+  "CreationToken": "$uuid"
+}
+"@
+$metadata = $metadata -replace '([\\]*)"', '$1$1\"'
+aws backup start-restore-job `
+--recovery-point-arn "arn:aws:backup:eu-central-1:012345678901:recovery-point:continuous:simphera-reference-production-0f51c39b" `
+--iam-role-arn $rolearn `
+--metadata $metadata
+```
+
+Alternatively, you can [restore the S3 data via the AWS console](https://docs.aws.amazon.com/aws-backup/latest/devguide/restoring-s3.html).
+
+## Encryption
+
+Encryption is enabled at all AWS resources that are created by Terraform:
+
+- PostgreSQL databases
+- S3 buckets
+- EFS (Elastic file system)
+- CloudWatch logs
+- Backup Vault
+
+## List of tools with versions needed for Simphera reference architecture deployment
+
+| Tool name | Version |
+| -- | -- |
+| AWS CLI | >=2.10.0 |
+| Helm | >=3.8.0 |
+| Terraform | >=1.3.0 |
+| kubectl | >=1.27.0 |
+
+<!-- BEGIN_TF_DOCS -->
+## Requirements
+
+| Name | Version |
+|------|---------|
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.3.0 |
+| <a name="requirement_aws"></a> [aws](#requirement\_aws) | = 5.37.0 |
+| <a name="requirement_helm"></a> [helm](#requirement\_helm) | >= 2.4.1 |
+| <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | >= 2.10 |
+| <a name="requirement_random"></a> [random](#requirement\_random) | >= 3.0.0 |
+
+## Providers
+
+| Name | Version |
+|------|---------|
+| <a name="provider_aws"></a> [aws](#provider\_aws) | 5.37.0 |
+| <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | 2.30.0 |
+| <a name="provider_random"></a> [random](#provider\_random) | 3.6.2 |
+
+## Modules
+
+| Name | Source | Version |
+|------|--------|---------|
+| <a name="module_eks"></a> [eks](#module\_eks) | git::https://github.com/aws-ia/terraform-aws-eks-blueprints.git | v4.32.1 |
+| <a name="module_eks-addons"></a> [eks-addons](#module\_eks-addons) | git::https://github.com/aws-ia/terraform-aws-eks-blueprints.git//modules/kubernetes-addons | v4.32.1 |
+| <a name="module_k8s_eks_addons"></a> [k8s\_eks\_addons](#module\_k8s\_eks\_addons) | ./modules/k8s_eks_addons | n/a |
+| <a name="module_security_group"></a> [security\_group](#module\_security\_group) | terraform-aws-modules/security-group/aws | ~> 4 |
+| <a name="module_security_group_license_server"></a> [security\_group\_license\_server](#module\_security\_group\_license\_server) | terraform-aws-modules/security-group/aws | ~> 4 |
+| <a name="module_simphera_instance"></a> [simphera\_instance](#module\_simphera\_instance) | ./modules/simphera_aws_instance | n/a |
+| <a name="module_vpc"></a> [vpc](#module\_vpc) | terraform-aws-modules/vpc/aws | v5.8.1 |
+
+## Resources
+
+| Name | Type |
+|------|------|
+| [aws_autoscaling_group_tag.default_node-template_resources_ephemeral-storage](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/autoscaling_group_tag) | resource |
+| [aws_autoscaling_group_tag.execnodes](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/autoscaling_group_tag) | resource |
+| [aws_autoscaling_group_tag.execnodes_node-template_resources_ephemeral-storage](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/autoscaling_group_tag) | resource |
+| [aws_autoscaling_group_tag.gpuexecnodes](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/autoscaling_group_tag) | resource |
+| [aws_autoscaling_group_tag.gpuexecnodes_node-template_resources_ephemeral-storage](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/autoscaling_group_tag) | resource |
+| [aws_autoscaling_group_tag.gpuivsnodes](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/autoscaling_group_tag) | resource |
+| [aws_cloudwatch_log_group.flowlogs](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/cloudwatch_log_group) | resource |
+| [aws_cloudwatch_log_group.ssm_install_log_group](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/cloudwatch_log_group) | resource |
+| [aws_cloudwatch_log_group.ssm_scan_log_group](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/cloudwatch_log_group) | resource |
+| [aws_ecr_pull_through_cache_rule.dspacecloudreleases](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ecr_pull_through_cache_rule) | resource |
+| [aws_efs_file_system.efs_file_system](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/efs_file_system) | resource |
+| [aws_efs_file_system_policy.policy](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/efs_file_system_policy) | resource |
+| [aws_efs_mount_target.mount_target](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/efs_mount_target) | resource |
+| [aws_flow_log.flowlog](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/flow_log) | resource |
+| [aws_iam_instance_profile.license_server_profile](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_instance_profile) | resource |
+| [aws_iam_policy.ecr_policy](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_policy) | resource |
+| [aws_iam_policy.flowlogs_policy](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_policy) | resource |
+| [aws_iam_policy.license_server_policy](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_policy) | resource |
+| [aws_iam_role.flowlogs_role](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_role) | resource |
+| [aws_iam_role.license_server_role](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_role) | resource |
+| [aws_iam_role_policy_attachment.eks-attach-ecr](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_role_policy_attachment) | resource |
+| [aws_iam_role_policy_attachment.flowlogs_attachment](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_role_policy_attachment) | resource |
+| [aws_iam_role_policy_attachment.license_server_ssm](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_role_policy_attachment) | resource |
+| [aws_iam_role_policy_attachment.minio_policy_attachment](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/iam_role_policy_attachment) | resource |
+| [aws_instance.license_server](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/instance) | resource |
+| [aws_kms_key.kms_key_cloudwatch_log_group](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/kms_key) | resource |
+| [aws_s3_bucket.bucket_logs](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/s3_bucket) | resource |
+| [aws_s3_bucket.license_server_bucket](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/s3_bucket) | resource |
+| [aws_s3_bucket_logging.logging](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/s3_bucket_logging) | resource |
+| [aws_s3_bucket_policy.buckets_logs_ssl](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/s3_bucket_policy) | resource |
+| [aws_s3_bucket_policy.license_server_bucket_ssl](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/s3_bucket_policy) | resource |
+| [aws_s3_bucket_public_access_block.buckets_logs_access](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/s3_bucket_public_access_block) | resource |
+| [aws_s3_bucket_server_side_encryption_configuration.bucket_logs_encryption](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/s3_bucket_server_side_encryption_configuration) | resource |
+| [aws_secretsmanager_secret.ecr_pullthroughcache_dspacecloudreleases](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/secretsmanager_secret) | resource |
+| [aws_secretsmanager_secret_version.ecr_credentials](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/secretsmanager_secret_version) | resource |
+| [aws_ssm_maintenance_window.install](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_maintenance_window) | resource |
+| [aws_ssm_maintenance_window.scan](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_maintenance_window) | resource |
+| [aws_ssm_maintenance_window_target.install](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_maintenance_window_target) | resource |
+| [aws_ssm_maintenance_window_target.scan](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_maintenance_window_target) | resource |
+| [aws_ssm_maintenance_window_target.scan_eks_nodes](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_maintenance_window_target) | resource |
+| [aws_ssm_maintenance_window_task.install](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_maintenance_window_task) | resource |
+| [aws_ssm_maintenance_window_task.scan](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_maintenance_window_task) | resource |
+| [aws_ssm_patch_baseline.production](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_patch_baseline) | resource |
+| [aws_ssm_patch_group.patch_group](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/resources/ssm_patch_group) | resource |
+| [kubernetes_storage_class_v1.efs](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/storage_class_v1) | resource |
+| [random_string.policy_suffix](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/string) | resource |
+| [aws_ami.al2gpu_ami](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/ami) | data source |
+| [aws_ami.amazon_linux_kernel5](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/ami) | data source |
+| [aws_availability_zones.available](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/availability_zones) | data source |
+| [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/caller_identity) | data source |
+| [aws_eks_node_group.default](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/eks_node_group) | data source |
+| [aws_eks_node_group.execnodes](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/eks_node_group) | data source |
+| [aws_eks_node_group.gpuexecnodes](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/eks_node_group) | data source |
+| [aws_eks_node_group.gpuivsnodes](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/eks_node_group) | data source |
+| [aws_iam_policy_document.eks_node_custom_inline_policy](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/iam_policy_document) | data source |
+| [aws_iam_policy_document.policy](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/iam_policy_document) | data source |
+| [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/partition) | data source |
+| [aws_region.current](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/region) | data source |
+| [aws_subnet.private_subnet](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/subnet) | data source |
+| [aws_subnet.public_subnet](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/subnet) | data source |
+| [aws_subnets.private_subnets](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/subnets) | data source |
+| [aws_subnets.public_subnets](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/subnets) | data source |
+| [aws_vpc.preconfigured](https://registry.terraform.io/providers/hashicorp/aws/5.37.0/docs/data-sources/vpc) | data source |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+|------|-------------|------|---------|:--------:|
+| <a name="input_cloudwatch_retention"></a> [cloudwatch\_retention](#input\_cloudwatch\_retention) | Global cloudwatch retention period for the EKS, VPC, SSM, and PostgreSQL logs. | `number` | `7` | no |
+| <a name="input_cluster_autoscaler_config"></a> [cluster\_autoscaler\_config](#input\_cluster\_autoscaler\_config) | Input configuration for cluster-autoscaler deployed with helm release. By setting key 'enable' to 'true', cluster-autoscaler release will be deployed. 'helm\_repository' is an URL for the repository of cluster-autoscaler helm chart, where 'helm\_version' is its respective version of a chart. 'chart\_values' is used for changing default values.yaml of a cluster-autoscaler chart. | <pre>object({<br>    enable          = optional(bool, true)<br>    helm_repository = optional(string, "https://kubernetes.github.io/autoscaler")<br>    helm_version    = optional(string, "9.37.0")<br>    chart_values = optional(string, <<-YAML<br><br>    YAML<br>    )<br>  })</pre> | `{}` | no |
+| <a name="input_codemeter"></a> [codemeter](#input\_codemeter) | Download link for codemeter rpm package. | `string` | `"https://www.wibu.com/support/user/user-software/file/download/13346.html?tx_wibudownloads_downloadlist%5BdirectDownload%5D=directDownload&tx_wibudownloads_downloadlist%5BuseAwsS3%5D=0&cHash=8dba7ab094dec6267346f04fce2a2bcd"` | no |
+| <a name="input_coredns_config"></a> [coredns\_config](#input\_coredns\_config) | Input configuration for AWS EKS add-on coredns. By setting key 'enable' to 'true', coredns add-on is deployed. Key 'configuration\_values' is used to change add-on configuration. Its content should follow add-on configuration schema (see https://aws.amazon.com/blogs/containers/amazon-eks-add-ons-advanced-configuration/). | <pre>object({<br>    enable               = optional(bool, true)<br>    configuration_values = optional(string, null)<br>  })</pre> | <pre>{<br>  "enable": true<br>}</pre> | no |
+| <a name="input_ecr_pullthrough_cache_rule_config"></a> [ecr\_pullthrough\_cache\_rule\_config](#input\_ecr\_pullthrough\_cache\_rule\_config) | Specifies if ECR pull through cache rule and accompanying resources will be created. Key 'enable' indicates whether pull through cache rule needs to be enabled for the cluster. When 'enable' is set to 'true', key 'exist' indicates whether pull through cache rule already exists for region's private ECR. If key 'enable' is set to 'true', IAM policy will be attached to the cluster's nodes. Additionally, if 'exist' is set to 'false', credentials for upstream registry and pull through cache rule will be created | <pre>object({<br>    enable = bool<br>    exist  = bool<br>  })</pre> | <pre>{<br>  "enable": false,<br>  "exist": false<br>}</pre> | no |
+| <a name="input_enable_aws_for_fluentbit"></a> [enable\_aws\_for\_fluentbit](#input\_enable\_aws\_for\_fluentbit) | Install FluentBit to send container logs to CloudWatch. | `bool` | `false` | no |
+| <a name="input_enable_ivs"></a> [enable\_ivs](#input\_enable\_ivs) | n/a | `bool` | `false` | no |
+| <a name="input_enable_patching"></a> [enable\_patching](#input\_enable\_patching) | Scans license server EC2 instance and EKS nodes for updates. Installs patches on license server automatically. EKS nodes need to be updated manually. | `bool` | `false` | no |
+| <a name="input_gpuNodeCountMax"></a> [gpuNodeCountMax](#input\_gpuNodeCountMax) | The maximum number of nodes for gpu job execution | `number` | `12` | no |
+| <a name="input_gpuNodeCountMin"></a> [gpuNodeCountMin](#input\_gpuNodeCountMin) | The minimum number of nodes for gpu job execution | `number` | `0` | no |
+| <a name="input_gpuNodeDiskSize"></a> [gpuNodeDiskSize](#input\_gpuNodeDiskSize) | The disk size in GiB of the nodes for the gpu job execution | `number` | `100` | no |
+| <a name="input_gpuNodePool"></a> [gpuNodePool](#input\_gpuNodePool) | Specifies whether an additional node pool for gpu job execution is added to the kubernetes cluster | `bool` | `false` | no |
+| <a name="input_gpuNodeSize"></a> [gpuNodeSize](#input\_gpuNodeSize) | The machine size of the nodes for the gpu job execution | `list(string)` | <pre>[<br>  "g5.2xlarge"<br>]</pre> | no |
+| <a name="input_gpuNvidiaDriverVersion"></a> [gpuNvidiaDriverVersion](#input\_gpuNvidiaDriverVersion) | The NVIDIA driver version for GPU node group. | `string` | `"535.54.03"` | no |
+| <a name="input_infrastructurename"></a> [infrastructurename](#input\_infrastructurename) | The name of the infrastructure. e.g. simphera-infra | `string` | `"simphera"` | no |
+| <a name="input_ingress_nginx_config"></a> [ingress\_nginx\_config](#input\_ingress\_nginx\_config) | Input configuration for ingress-nginx service deployed with helm release. By setting key 'enable' to 'true', ingress-nginx service will be deployed. 'helm\_repository' is an URL for the repository of ingress-nginx helm chart, where 'helm\_version' is its respective version of a chart. 'chart\_values' is used for changing default values.yaml of an ingress-nginx chart. | <pre>object({<br>    enable          = bool<br>    helm_repository = optional(string, "https://kubernetes.github.io/ingress-nginx")<br>    helm_version    = optional(string, "4.1.4")<br>    chart_values = optional(string, <<-YAML<br>controller:<br>  images:<br>    registry: "registry.k8s.io"<br>  service:<br>    annotations:<br>      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing<br>YAML<br>    )<br>  })</pre> | <pre>{<br>  "enable": false<br>}</pre> | no |
+| <a name="input_install_schedule"></a> [install\_schedule](#input\_install\_schedule) | 6-field Cron expression describing the install maintenance schedule. Must not overlap with variable scan\_schedule. | `string` | `"cron(0 3 * * ? *)"` | no |
+| <a name="input_ivsGpuNodeCountMax"></a> [ivsGpuNodeCountMax](#input\_ivsGpuNodeCountMax) | The maximum number of GPU nodes nodes for IVS jobs | `number` | `2` | no |
+| <a name="input_ivsGpuNodeCountMin"></a> [ivsGpuNodeCountMin](#input\_ivsGpuNodeCountMin) | The minimum number of GPU nodes nodes for IVS jobs | `number` | `0` | no |
+| <a name="input_ivsGpuNodeDiskSize"></a> [ivsGpuNodeDiskSize](#input\_ivsGpuNodeDiskSize) | The disk size in GiB of the nodes for the IVS gpu job execution | `number` | `100` | no |
+| <a name="input_ivsGpuNodePool"></a> [ivsGpuNodePool](#input\_ivsGpuNodePool) | Specifies whether an additional node pool for IVS gpu job execution is added to the kubernetes cluster | `bool` | `false` | no |
+| <a name="input_ivsGpuNodeSize"></a> [ivsGpuNodeSize](#input\_ivsGpuNodeSize) | The machine size of the GPU nodes for IVS jobs | `list(string)` | <pre>[<br>  "g4dn.2xlarge"<br>]</pre> | no |
+| <a name="input_kubernetesVersion"></a> [kubernetesVersion](#input\_kubernetesVersion) | The kubernetes version of the EKS cluster. | `string` | `"1.30"` | no |
+| <a name="input_licenseServer"></a> [licenseServer](#input\_licenseServer) | Specifies whether a license server VM will be created. | `bool` | `false` | no |
+| <a name="input_linuxExecutionNodeCountMax"></a> [linuxExecutionNodeCountMax](#input\_linuxExecutionNodeCountMax) | The maximum number of Linux nodes for the job execution | `number` | `10` | no |
+| <a name="input_linuxExecutionNodeCountMin"></a> [linuxExecutionNodeCountMin](#input\_linuxExecutionNodeCountMin) | The minimum number of Linux nodes for the job execution | `number` | `0` | no |
+| <a name="input_linuxExecutionNodeDiskSize"></a> [linuxExecutionNodeDiskSize](#input\_linuxExecutionNodeDiskSize) | The disk size in GiB of the nodes for the job execution | `number` | `200` | no |
+| <a name="input_linuxExecutionNodeSize"></a> [linuxExecutionNodeSize](#input\_linuxExecutionNodeSize) | The machine size of the Linux nodes for the job execution, user must check the availability of the instance types for the region. The list is ordered by priority where the first instance type gets the highest priority. Instance types must fulfill the following requirements: 64 GB RAM, 16 vCPUs, at least 110 IPs, at least 2 availability zones. | `list(string)` | <pre>[<br>  "m6a.4xlarge",<br>  "m5a.4xlarge",<br>  "m5.4xlarge",<br>  "m6i.4xlarge",<br>  "m4.4xlarge",<br>  "m7i.4xlarge",<br>  "m7a.4xlarge"<br>]</pre> | no |
+| <a name="input_linuxNodeCountMax"></a> [linuxNodeCountMax](#input\_linuxNodeCountMax) | The maximum number of Linux nodes for the regular services | `number` | `12` | no |
+| <a name="input_linuxNodeCountMin"></a> [linuxNodeCountMin](#input\_linuxNodeCountMin) | The minimum number of Linux nodes for the regular services | `number` | `1` | no |
+| <a name="input_linuxNodeDiskSize"></a> [linuxNodeDiskSize](#input\_linuxNodeDiskSize) | The disk size in GiB of the nodes for the regular services | `number` | `200` | no |
+| <a name="input_linuxNodeSize"></a> [linuxNodeSize](#input\_linuxNodeSize) | The machine size of the Linux nodes for the regular services, user must check the availability of the instance types for the region. The list is ordered by priority where the first instance type gets the highest priority. Instance types must fulfill the following requirements: 64 GB RAM, 16 vCPUs, at least 110 IPs, at least 2 availability zones. | `list(string)` | <pre>[<br>  "m6a.4xlarge",<br>  "m5a.4xlarge",<br>  "m5.4xlarge",<br>  "m6i.4xlarge",<br>  "m4.4xlarge",<br>  "m7i.4xlarge",<br>  "m7a.4xlarge"<br>]</pre> | no |
+| <a name="input_maintainance_duration"></a> [maintainance\_duration](#input\_maintainance\_duration) | How long in hours for the maintenance window. | `number` | `3` | no |
+| <a name="input_map_accounts"></a> [map\_accounts](#input\_map\_accounts) | Additional AWS account numbers to add to the aws-auth ConfigMap | `list(string)` | `[]` | no |
+| <a name="input_map_roles"></a> [map\_roles](#input\_map\_roles) | Additional IAM roles to add to the aws-auth ConfigMap | <pre>list(object({<br>    rolearn  = string<br>    username = string<br>    groups   = list(string)<br>  }))</pre> | `[]` | no |
+| <a name="input_map_users"></a> [map\_users](#input\_map\_users) | Additional IAM users to add to the aws-auth ConfigMap | <pre>list(object({<br>    userarn  = string<br>    username = string<br>    groups   = list(string)<br>  }))</pre> | `[]` | no |
+| <a name="input_private_subnet_ids"></a> [private\_subnet\_ids](#input\_private\_subnet\_ids) | List of IDs for the private subnets. | `list(any)` | `[]` | no |
+| <a name="input_public_subnet_ids"></a> [public\_subnet\_ids](#input\_public\_subnet\_ids) | List of IDs for the public subnets. | `list(any)` | `[]` | no |
+| <a name="input_rtMaps_link"></a> [rtMaps\_link](#input\_rtMaps\_link) | Download link for RTMaps license server. | `string` | `"http://dl.intempora.com/RTMaps4/rtmaps_4.9.0_ubuntu1804_x86_64_release.tar.bz2"` | no |
+| <a name="input_s3_csi_config"></a> [s3\_csi\_config](#input\_s3\_csi\_config) | Input configuration for AWS EKS add-on aws-mountpoint-s3-csi-driver. By setting key 'enable' to 'true', aws-mountpoint-s3-csi-driver add-on is deployed. Key 'configuration\_values' is used to change add-on configuration. Its content should follow add-on configuration schema (see https://aws.amazon.com/blogs/containers/amazon-eks-add-ons-advanced-configuration/). | <pre>object({<br>    enable = optional(bool, false)<br>    configuration_values = optional(string, <<-YAML<br>node:<br>    tolerateAllTaints: true<br>YAML<br>    )<br>  })</pre> | <pre>{<br>  "enable": false<br>}</pre> | no |
+| <a name="input_scan_schedule"></a> [scan\_schedule](#input\_scan\_schedule) | 6-field Cron expression describing the scan maintenance schedule. Must not overlap with variable install\_schedule. | `string` | `"cron(0 0 * * ? *)"` | no |
+| <a name="input_simpheraInstances"></a> [simpheraInstances](#input\_simpheraInstances) | A list containing the individual SIMPHERA instances, such as 'staging' and 'production'. | <pre>map(object({<br>    name                         = string<br>    postgresqlApplyImmediately   = bool<br>    postgresqlVersion            = string<br>    postgresqlStorage            = number<br>    postgresqlMaxStorage         = number<br>    db_instance_type_simphera    = string<br>    enable_keycloak              = bool<br>    postgresqlStorageKeycloak    = number<br>    postgresqlMaxStorageKeycloak = number<br>    db_instance_type_keycloak    = string<br>    k8s_namespace                = string<br>    secretname                   = string<br>    enable_backup_service        = bool<br>    backup_retention             = number<br>    enable_deletion_protection   = bool<br><br>  }))</pre> | <pre>{<br>  "production": {<br>    "backup_retention": 35,<br>    "db_instance_type_keycloak": "db.t4g.large",<br>    "db_instance_type_simphera": "db.t4g.large",<br>    "enable_backup_service": true,<br>    "enable_deletion_protection": true,<br>    "enable_keycloak": true,<br>    "k8s_namespace": "simphera",<br>    "name": "production",<br>    "postgresqlApplyImmediately": false,<br>    "postgresqlMaxStorage": 100,<br>    "postgresqlMaxStorageKeycloak": 100,<br>    "postgresqlStorage": 20,<br>    "postgresqlStorageKeycloak": 20,<br>    "postgresqlVersion": "16",<br>    "secretname": "aws-simphera-dev-production"<br>  }<br>}</pre> | no |
+| <a name="input_tags"></a> [tags](#input\_tags) | The tags to be added to all resources. | `map(any)` | `{}` | no |
+| <a name="input_vpcCidr"></a> [vpcCidr](#input\_vpcCidr) | The CIDR for the virtual private cluster. | `string` | `"10.1.0.0/18"` | no |
+| <a name="input_vpcId"></a> [vpcId](#input\_vpcId) | The ID of preconfigured VPC. Change from 'null' to use already existing VPC. | `string` | `null` | no |
+| <a name="input_vpcPrivateSubnets"></a> [vpcPrivateSubnets](#input\_vpcPrivateSubnets) | List of CIDRs for the private subnets. | `list(any)` | <pre>[<br>  "10.1.0.0/22",<br>  "10.1.4.0/22",<br>  "10.1.8.0/22"<br>]</pre> | no |
+| <a name="input_vpcPublicSubnets"></a> [vpcPublicSubnets](#input\_vpcPublicSubnets) | List of CIDRs for the public subnets. | `list(any)` | <pre>[<br>  "10.1.12.0/22",<br>  "10.1.16.0/22",<br>  "10.1.20.0/22"<br>]</pre> | no |
+
+## Outputs
+
+| Name | Description |
+|------|-------------|
+| <a name="output_account_id"></a> [account\_id](#output\_account\_id) | The AWS account id used for creating resources. |
+| <a name="output_backup_vaults"></a> [backup\_vaults](#output\_backup\_vaults) | Backups vaults from all SIMPHERA instances. |
+| <a name="output_database_endpoints"></a> [database\_endpoints](#output\_database\_endpoints) | Identifiers of the SIMPHERA and Keycloak databases from all SIMPHERA instances. |
+| <a name="output_database_identifiers"></a> [database\_identifiers](#output\_database\_identifiers) | Identifiers of the SIMPHERA and Keycloak databases from all SIMPHERA instances. |
+| <a name="output_eks_cluster_id"></a> [eks\_cluster\_id](#output\_eks\_cluster\_id) | Amazon EKS Cluster Name |
+| <a name="output_pullthrough_cache_prefix"></a> [pullthrough\_cache\_prefix](#output\_pullthrough\_cache\_prefix) | n/a |
+| <a name="output_s3_buckets"></a> [s3\_buckets](#output\_s3\_buckets) | S3 buckets from all SIMPHERA instances. |
+<!-- END_TF_DOCS -->
